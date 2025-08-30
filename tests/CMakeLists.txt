@@ -4,7 +4,7 @@ endif()
 
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(${CMAKE_SOURCE_DIR}/external/googletest)
+add_subdirectory(${CMAKE_SOURCE_DIR}/external/googletest ${CMAKE_BINARY_DIR}/external/googletest)
 
 add_executable(test_signer test_signer.cpp)
 target_link_libraries(test_signer
