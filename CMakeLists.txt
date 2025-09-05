@@ -24,34 +24,81 @@ set(SECP256K1_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(SECP256K1_ENABLE_MODULE_RECOVERY ON CACHE BOOL "" FORCE)
 add_subdirectory(external/secp256k1)
 
-# Download and build libsodium from release tarball
-include(ExternalProject)
+# Sodium dependency resolution
+# - On Apple (macOS/iOS/simulator): use external/sodium.xcframework (build it if missing)
+# - Otherwise: find_package(sodium)
 
-set(LIBSODIUM_VERSION "1.0.20")
-set(LIBSODIUM_URL "https://download.libsodium.org/libsodium/releases/libsodium-${LIBSODIUM_VERSION}.tar.gz")
-set(LIBSODIUM_SHA256 "ebb65ef6ca439333c2bb41a0c1990587288da07f6c7fd07cb3a18cc18d30ce19")
+set(SODIUM_TARGET "")
 
-ExternalProject_Add(
-    libsodium_build
-    URL ${LIBSODIUM_URL}
-    URL_HASH SHA256=${LIBSODIUM_SHA256}
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${CMAKE_BINARY_DIR}/libsodium --disable-shared --enable-static --with-pic
-    BUILD_COMMAND make
-    INSTALL_COMMAND make install
-    BUILD_IN_SOURCE 0
-    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/libsodium/lib/libsodium.a
-)
+if(APPLE)
+    set(SODIUM_XC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/sodium.xcframework")
+    if(NOT EXISTS "${SODIUM_XC_DIR}")
+        message(STATUS "sodium.xcframework not found. Running build-sodium.sh to create it...")
+        execute_process(
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/build-sodium.sh"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            RESULT_VARIABLE SODIUM_BUILD_RESULT
+        )
+        if(NOT SODIUM_BUILD_RESULT EQUAL 0)
+            message(FATAL_ERROR "Failed to build sodium.xcframework (exit code ${SODIUM_BUILD_RESULT})")
+        endif()
+    endif()
 
-# Create imported target for libsodium
-add_library(sodium INTERFACE)
-add_dependencies(sodium libsodium_build)
-target_link_libraries(sodium INTERFACE ${CMAKE_BINARY_DIR}/libsodium/lib/libsodium.a)
-target_include_directories(sodium INTERFACE ${CMAKE_BINARY_DIR}/libsodium/include)
+    # Resolve correct slice from XCFramework
+    set(SODIUM_LIB "")
+    set(SODIUM_INCLUDE "")
+
+    if(CMAKE_OSX_SYSROOT STREQUAL "iphoneos")
+        file(GLOB _SODIUM_IOS_DEVICE_LIBS "${SODIUM_XC_DIR}/ios-*/libsodium.a")
+        if(_SODIUM_IOS_DEVICE_LIBS)
+            list(FILTER _SODIUM_IOS_DEVICE_LIBS EXCLUDE REGEX "simulator")
+            list(GET _SODIUM_IOS_DEVICE_LIBS 0 SODIUM_LIB)
+            get_filename_component(_SLICE_DIR "${SODIUM_LIB}" DIRECTORY)
+            set(SODIUM_INCLUDE "${_SLICE_DIR}/Headers")
+        endif()
+    elseif(CMAKE_OSX_SYSROOT STREQUAL "iphonesimulator")
+        file(GLOB _SODIUM_IOS_SIM_LIBS "${SODIUM_XC_DIR}/ios-*/libsodium.a")
+        if(_SODIUM_IOS_SIM_LIBS)
+            list(FILTER _SODIUM_IOS_SIM_LIBS INCLUDE REGEX "simulator")
+            list(GET _SODIUM_IOS_SIM_LIBS 0 SODIUM_LIB)
+            get_filename_component(_SLICE_DIR "${SODIUM_LIB}" DIRECTORY)
+            set(SODIUM_INCLUDE "${_SLICE_DIR}/Headers")
+        endif()
+    else()
+        # macOS
+        file(GLOB _SODIUM_MAC_LIBS "${SODIUM_XC_DIR}/macos-*/libsodium.a")
+        if(_SODIUM_MAC_LIBS)
+            list(GET _SODIUM_MAC_LIBS 0 SODIUM_LIB)
+            get_filename_component(_SLICE_DIR "${SODIUM_LIB}" DIRECTORY)
+            set(SODIUM_INCLUDE "${_SLICE_DIR}/Headers")
+        endif()
+    endif()
+
+    if(NOT SODIUM_LIB OR NOT EXISTS "${SODIUM_LIB}")
+        message(FATAL_ERROR "Failed to locate libsodium.a within ${SODIUM_XC_DIR} for sysroot ${CMAKE_OSX_SYSROOT}")
+    endif()
+
+    add_library(sodium STATIC IMPORTED)
+    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION "${SODIUM_LIB}")
+    target_include_directories(sodium INTERFACE "${SODIUM_INCLUDE}")
+    set(SODIUM_TARGET sodium)
+else()
+    find_package(sodium REQUIRED)
+    # When found via find_package, the imported target may be 'sodium::sodium' or just 'sodium'
+    # Prefer the standard names if available
+    if(TARGET sodium::sodium)
+        set(SODIUM_TARGET sodium::sodium)
+    elseif(TARGET sodium)
+        set(SODIUM_TARGET sodium)
+    else()
+        message(FATAL_ERROR "sodium library not found by find_package")
+    endif()
+endif()
 
 target_link_libraries(signer
     PRIVATE
         secp256k1
-        sodium
+        ${SODIUM_TARGET}
 )
 
 
@@ -60,5 +107,11 @@ target_link_libraries(signer
 
 add_library(signer::signer ALIAS signer)
 
-enable_testing()
-add_subdirectory(tests)
+# Enable tests except for iOS device/simulator builds or Xcode generator
+if((APPLE AND (CMAKE_OSX_SYSROOT STREQUAL "iphoneos" OR CMAKE_OSX_SYSROOT STREQUAL "iphonesimulator"))
+   OR (CMAKE_GENERATOR STREQUAL "Xcode"))
+    message(STATUS "Skipping tests (sysroot: ${CMAKE_OSX_SYSROOT}, generator: ${CMAKE_GENERATOR})")
+else()
+    enable_testing()
+    add_subdirectory(tests)
+endif()
